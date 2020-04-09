@@ -1,0 +1,257 @@
+---
+title: "Final"
+author: "蔡淳如"
+date: "12/15/2019"
+output:
+  html_document:
+    highlight: zenburn
+    number_sections: yes
+    theme: cerulean
+    toc: yes
+    css: style.css
+    self_contained: no
+editor_options:
+  chunk_output_type: inline
+---
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+Sys.setenv(LANGUAGE = "en")
+options(stringsAsFactors = F)
+library(tidyverse)
+library(tidytext)
+library(jiebaR)
+```
+
+# Data
+```{r}
+#read all raw news data
+bbs_raw <- read.csv("bda2019_dataset/bbs.csv")
+forum_raw <- read.csv("bda2019_dataset/forum.csv")
+news_raw <- read.csv("bda2019_dataset/news.csv")
+stock_raw <- read.csv("stock_all.csv")
+stock_cor_raw <- read.csv(("stock_all_cor.csv")) %>% select(date, buy_cor, sell_cor, spread_cor) %>% View()
+
+#load tokens and entropy data
+load("all_tokens.rda")
+load("entropy.rda")
+
+#tidy and bind news data
+bbs <- bbs_raw %>% select(s_name, post_time, title, content) %>%
+  filter(str_detect(title, pattern = fixed("[公告]")) == F)
+forum <- forum_raw %>% select(s_name, post_time, title, content)
+news <- news_raw %>% select(author, post_time, title, content) %>% rename(s_name = author)
+all_news <- bbs %>%
+  bind_rows(forum) %>%
+  bind_rows(news) %>%
+  filter(!(content %in% c(""))) %>%
+  mutate(date = str_sub(post_time, 1, -10)) %>%
+  mutate(date = lubridate::ymd(date)) %>%
+  arrange(date) %>%
+  mutate(newsid = row_number()) %>%
+  select(date, newsid, content) %>%
+  na.omit()
+
+#tidy and label index's fluctuation
+
+#stock_index <- stock_raw %>%
+#  select(date, fluctuation) %>%
+#  mutate(date = lubridate::ymd(date)) %>%
+#  mutate(up_down = ifelse(fluctuation > 10, "up", ifelse(fluctuation < -10, "down", #"flat"))) %>%
+#  mutate(up_down = as.factor(up_down))
+stock_index <- stock_raw %>%
+  select(date, fluctuation, TAIEX) %>%
+  mutate(date = lubridate::ymd(date)) %>%
+  mutate(TAIEX = as.numeric(str_replace_all(TAIEX,",",""))) %>%
+  mutate(fluc_perc = (TAIEX/lag(TAIEX) - 1) * 100) %>%
+  mutate(up_down = ifelse(fluc_perc > 0, "up", ifelse(fluc_perc < -0, "down", "flat"))) %>%
+  mutate(up_down = as.factor(up_down)) %>%
+  drop_na()
+
+#tidy and label retail's decision
+#481~490/20171218~1229
+stock_cor <- stock_cor_raw[-c(481:490),]
+stock_re <- stock_cor %>%
+  select(date, volume, buy_cor, sell_cor) %>%
+  mutate(date = lubridate::ymd(date)) %>%
+  mutate(volume = as.numeric(str_replace_all(volume,",",""))) %>%
+  mutate(buy_cor = as.numeric(str_replace_all(buy_cor,",",""))) %>%
+  mutate(sell_cor = as.numeric(str_replace_all(sell_cor,",",""))) %>%
+  mutate(buy_re = volume - buy_cor, sell_re = volume - sell_cor, spread_re = buy_re - sell_re) %>%
+  select(date, spread_re, volume) %>%
+  #mutate(spread_re = abs(spread_re)) %>% arrange(spread_re)
+  mutate(buy_sell = if_else(spread_re / volume > 0, "buy",if_else(spread_re / volume < -0, "sell", "no"))) %>%
+  #mutate(buy_sell = if_else(spread_re > 1000000000, "buy",if_else(spread_re < -1000000000, "sell", "no"))) %>%
+  mutate(buy_sell = as.factor(buy_sell))
+```
+
+# Label
+```{r}
+#bind news with labeled stock data
+labeled <- all_news %>%
+  select(date, newsid, content) %>%
+  group_by(date) %>%
+  right_join(stock_index %>% select(date, up_down), by = "date") %>%
+  right_join(stock_re %>% select(date, buy_sell), by = "date") %>%
+  ungroup()
+```
+
+# Feature selection
+## feature 1: high-freq words
+```{r}
+f1_high <- all_tokens %>%
+  group_by(word) %>%
+  filter(n() >= 20000) %>% count()
+  ungroup() %>%
+  count(newsid, word)
+
+dtm1 <- f1_high %>%
+  cast_dtm(document = newsid, term = word, value = n)
+
+mat1 <- as.matrix(dtm1) %>% as_tibble() %>%
+  bind_cols(newsid = dtm1$dimnames$Docs) %>%
+  mutate(newsid = as.integer(newsid)) %>%
+  left_join(labeled %>% select(newsid), by = "newsid") %>%
+  select(newsid, everything())
+  
+colnames(mat1) <- make.names(colnames(mat1))
+
+```
+## Feature 2: sentiment corpus
+```{r}
+load("lexicon.rda")
+lexicon <- lexicon %>% rename(word = words)
+
+f2 <- all_tokens %>%
+  filter(word %in% lexicon$word) %>%
+  count(newsid, word)
+
+dtm2 <- f2 %>%
+  cast_dtm(document = newsid, term = word, value = n)
+
+mat2 <- as.matrix(dtm2) %>% as_tibble() %>%
+  bind_cols(newsid = dtm2$dimnames$Docs) %>%
+  mutate(newsid = as.integer(newsid)) %>%
+  left_join(labeled %>% select(newsid), by = "newsid") %>%
+  select(newsid, everything())
+  
+colnames(mat2) <- make.names(colnames(mat2))
+```
+## Feature 3: stock trend
+```{r}
+stock_trend <- stock_cor_raw %>%
+  mutate(date = lubridate::ymd(date)) %>%
+  mutate(lag_1 = lag(fluctuation)) %>%
+  mutate(lag_2 = lag(lag_1)) %>%
+  mutate(lag_3 = lag(lag_2)) %>%
+  mutate(trend = ifelse(lag_1 > 0 & lag_2 > 0 & lag_3 > 0, "up", ifelse(lag_1 < 0 & lag_2 < 0 & lag_3 < 0, "down", "flat")))
+trend_spread <- stock_trend %>%
+  select(date, trend) %>%
+  mutate(value = 1) %>%
+  spread(trend, value) %>%
+  replace_na(list(up = 0, down = 0, flat = 0)) %>%
+  select(-`<NA>`)
+
+f3 <- all_news %>%
+  select(date, newsid) %>%
+  group_by(date) %>%
+  right_join(trend_spread, by = "date") %>%
+  ungroup() %>%
+  select(-date)
+
+mat3 <- f3
+```
+
+# Train & Test set
+```{r}
+#bind all features
+mat <- mat1 %>%
+  full_join(mat2, by = "newsid") %>%
+  full_join(mat3, by = "newsid")
+#mat[is.na(mat)] <- 0
+mat <- mat %>% na.omit()
+```
+```{r}
+#divide to train and test set
+index <- sample(1:nrow(mat), ceiling(nrow(mat) * .70))
+train_mat <- mat[index,] %>%
+  left_join(labeled %>% select(up_down, buy_sell, newsid), by = "newsid") %>% na.omit()
+test_mat <- mat[-index,] %>%
+  left_join(labeled %>% select(up_down, buy_sell, newsid), by = "newsid") %>% na.omit()
+train_set <- train_mat
+test_set <- test_mat
+```
+
+# Model: Multinomial regression
+```{r}
+library(nnet)
+```
+## stock_index
+```{r}
+#accuracy of every news index's fluctuation
+predicted_ind_news <- test_set %>% select(newsid)
+fit_mnl <- multinom(up_down ~ ., data = train_set %>% select(-newsid, -buy_sell), MaxNWts = 5000)
+predicted_ind_news$predicted_up_down <- predict(fit_mnl, newdata = test_set %>% select(-newsid), "class")
+predicted_ind_news <- predicted_ind_news %>%
+  left_join(test_set %>% select(newsid, up_down), by = "newsid")
+
+conf_ind_news <- table(predicted_ind_news$predicted_up_down, predicted_ind_news$up_down)
+accuracy_ind_news <- sum(diag(conf_ind_news))/sum(conf_ind_news) * 100
+
+#accuracy of everyday index fluctuation
+predicted_ind_date <- predicted_ind_news %>%
+  select(newsid, predicted_up_down) %>%
+  left_join(labeled %>% select(date, newsid), by = "newsid") %>%
+  mutate(predicted_up_down = as.factor(predicted_up_down)) %>%
+  select(date, everything()) %>%
+  group_by(date, predicted_up_down) %>%
+  count() %>%
+  ungroup() %>%
+  arrange(date, desc(n)) %>%
+  group_by(date) %>%
+  top_n(1,n) %>%
+  ungroup() %>%
+  .[1:731,1:2] %>%
+  left_join(stock_index %>% select(date, up_down) ,by="date")
+  
+conf_ind_date <- table(predicted_date = predicted_ind_date$predicted_up_down, actual_date = predicted_ind_date$up_down)
+accuracy_ind_date <- sum(diag(conf_ind_date))/sum(conf_ind_date) * 100
+```
+## stock_re
+```{r}
+#accuracy of every news retail's decision
+predicted_re_news <- test_set %>% select(newsid)
+fit_mnl <- multinom(buy_sell ~ ., data = train_set %>% select(-newsid, -up_down), MaxNWts = 5000)
+predicted_re_news$predicted_buy_sell <- predict(fit_mnl, newdata = test_set %>% select(-newsid), "class")
+predicted_re_news <- predicted_re_news %>%
+  left_join(test_set %>% select(newsid, buy_sell), by = "newsid")
+
+conf_re_news <- table(predicted_re_news$predicted_buy_sell, predicted_re_news$buy_sell)
+accuracy_re_news <- sum(diag(conf_re_news))/sum(conf_re_news) * 100
+
+#accuracy of everyday retail's decision
+predicted_re_date <- predicted_re_news %>%
+  select(newsid, predicted_buy_sell) %>%
+  left_join(labeled %>% select(date, newsid), by = "newsid") %>%
+  mutate(predicted_buy_sell = as.factor(predicted_buy_sell)) %>%
+  select(date, everything()) %>%
+  group_by(date, predicted_buy_sell) %>%
+  count() %>%
+  ungroup() %>%
+  arrange(date, desc(n)) %>%
+  group_by(date) %>%
+  top_n(1,n) %>%
+  ungroup() %>%
+  .[1:731,1:2] %>%
+  left_join(stock_re %>% select(date, buy_sell) ,by="date")
+  
+conf_re_date <- table(predicted_date = predicted_re_date$predicted_buy_sell, actual_date = predicted_re_date$buy_sell)
+accuracy_re_date <- sum(diag(conf_re_date))/sum(conf_re_date) * 100
+```
+# Accuracy
+```{r}
+accuracy_ind_date #每日對整體股市
+accuracy_ind_news #每則新聞對整體股市
+accuracy_re_date  #每日對散戶決策
+accuracy_re_news  #每則新聞對散戶決策
+```
